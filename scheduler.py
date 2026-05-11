@@ -71,6 +71,8 @@ class Config:
     status_period_minutes: int = 10
     scheduler_interval_minutes: int = 10
     refresh_master_on_start: bool = False
+    master_daily_refresh_enabled: bool = True
+    master_refresh_hour_kst: int = 4
     request_timeout_seconds: int = 30
     max_retries: int = 4
     retry_base_sleep_seconds: float = 1.5
@@ -120,6 +122,8 @@ def load_config() -> Config:
         status_period_minutes=int(os.getenv("STATUS_PERIOD_MINUTES", "10")),
         scheduler_interval_minutes=int(os.getenv("SCHEDULER_INTERVAL_MINUTES", "10")),
         refresh_master_on_start=parse_bool(os.getenv("REFRESH_MASTER_ON_START"), False),
+        master_daily_refresh_enabled=parse_bool(os.getenv("MASTER_DAILY_REFRESH_ENABLED"), True),
+        master_refresh_hour_kst=int(os.getenv("MASTER_REFRESH_HOUR_KST", "4")),
     )
 
     if CONFIG.num_of_rows < 10 or CONFIG.num_of_rows > 9999:
@@ -128,15 +132,19 @@ def load_config() -> Config:
         raise RuntimeError("STATUS_PERIOD_MINUTES는 1 이상 10 이하로 설정해주세요.")
     if CONFIG.scheduler_interval_minutes < 1:
         raise RuntimeError("SCHEDULER_INTERVAL_MINUTES는 1 이상이어야 합니다.")
+    if CONFIG.master_refresh_hour_kst < 0 or CONFIG.master_refresh_hour_kst > 23:
+        raise RuntimeError("MASTER_REFRESH_HOUR_KST는 0 이상 23 이하로 설정해주세요.")
 
     logger.info(
-        "설정 로드 완료: db=%s, zcode=%s, numOfRows=%s, statusPeriod=%s분, interval=%s분, refreshMasterOnStart=%s",
+        "설정 로드 완료: db=%s, zcode=%s, numOfRows=%s, statusPeriod=%s분, interval=%s분, refreshMasterOnStart=%s, masterDailyRefresh=%s, masterRefreshHourKst=%s",
         CONFIG.mongodb_db_name,
         CONFIG.seoul_zcode,
         CONFIG.num_of_rows,
         CONFIG.status_period_minutes,
         CONFIG.scheduler_interval_minutes,
         CONFIG.refresh_master_on_start,
+        CONFIG.master_daily_refresh_enabled,
+        CONFIG.master_refresh_hour_kst,
     )
     return CONFIG
 
@@ -190,6 +198,16 @@ def create_indexes(db: Database) -> None:
         name="idx_status_zcode_stat",
     )
 
+    db.charger_current.create_index(
+        [("statId", 1), ("chgerId", 1)],
+        unique=True,
+        name="uq_current_statId_chgerId",
+    )
+    db.charger_current.create_index([("stat", 1)], name="idx_current_stat")
+    db.charger_current.create_index([("zcode", 1), ("stat", 1)], name="idx_current_zcode_stat")
+    db.charger_current.create_index([("lastObservedAt", -1)], name="idx_current_lastObservedAt")
+    db.charger_current.create_index([("eventAt", -1)], name="idx_current_eventAt")
+
     db.charger_stats.create_index(
         [("type", 1), ("collectedAtBucket", -1)],
         name="idx_stats_type_bucket",
@@ -228,6 +246,22 @@ def floor_datetime_to_minutes(dt: datetime, minutes: int) -> datetime:
     dt = dt.astimezone(timezone.utc)
     floored_minute = (dt.minute // minutes) * minutes
     return dt.replace(minute=floored_minute, second=0, microsecond=0)
+
+
+def parse_ev_datetime(value: Any) -> datetime | None:
+    """
+    API의 yyyymmddHHMMSS 문자열을 UTC datetime으로 변환합니다.
+
+    예: 20260504205004 -> 2026-05-04 20:50:04 KST -> UTC datetime
+    """
+    text = clean_str(value)
+    if text is None:
+        return None
+    try:
+        dt_kst = datetime.strptime(text, "%Y%m%d%H%M%S").replace(tzinfo=KST)
+        return dt_kst.astimezone(timezone.utc)
+    except ValueError:
+        return None
 
 
 # -----------------------------------------------------------------------------
@@ -516,6 +550,7 @@ def normalize_status_item(
         "busiId": clean_str(item.get("busiId")),
         "stat": clean_str(item.get("stat")),
         "statUpdDt": clean_str(item.get("statUpdDt")),
+        "eventAt": parse_ev_datetime(item.get("statUpdDt")),
         "zcode": clean_str(item.get("zcode")) or config.seoul_zcode,
         "collectedAt": collected_at,
         "collectedAtKst": to_kst_string(collected_at),
@@ -523,6 +558,104 @@ def normalize_status_item(
         "sourcePeriodMinutes": config.status_period_minutes,
         "raw": item,
     }
+
+
+
+# -----------------------------------------------------------------------------
+# charger_current 갱신 로직
+# -----------------------------------------------------------------------------
+
+
+def build_current_doc_from_status_doc(doc: dict[str, Any]) -> dict[str, Any]:
+    """getChargerStatus 결과를 charger_current 저장용 문서로 변환합니다."""
+    observed_at = doc["collectedAt"]
+    return {
+        "statId": doc["statId"],
+        "chgerId": doc["chgerId"],
+        "busiId": doc.get("busiId"),
+        "stat": doc.get("stat"),
+        "statUpdDt": doc.get("statUpdDt"),
+        "eventAt": doc.get("eventAt") or observed_at,
+        "zcode": doc.get("zcode"),
+        "lastObservedAt": observed_at,
+        "lastObservedAtKst": to_kst_string(observed_at),
+        "lastSnapshotBucket": doc.get("collectedAtBucket"),
+        "sourcePeriodMinutes": doc.get("sourcePeriodMinutes"),
+        "currentSource": "getChargerStatus",
+        "raw": doc.get("raw"),
+        "updatedAt": utc_now(),
+    }
+
+
+def build_current_doc_from_master_doc(doc: dict[str, Any], collected_at: datetime) -> dict[str, Any]:
+    """
+    getChargerInfo 결과로 charger_current 초기 문서를 만듭니다.
+
+    주의: master 수집은 현재 상태 컬렉션을 '초기 생성'하는 용도입니다.
+    이미 charger_current에 있는 문서는 상태 스케줄러가 더 최신일 수 있으므로 덮어쓰지 않습니다.
+    """
+    raw = doc.get("raw") or {}
+    stat_upd_dt = clean_str(raw.get("statUpdDt"))
+    return {
+        "statId": doc["statId"],
+        "chgerId": doc["chgerId"],
+        "busiId": doc.get("busiId"),
+        "stat": clean_str(raw.get("stat")),
+        "statUpdDt": stat_upd_dt,
+        "eventAt": parse_ev_datetime(stat_upd_dt) or collected_at,
+        "zcode": doc.get("zcode"),
+        "lastObservedAt": collected_at,
+        "lastObservedAtKst": to_kst_string(collected_at),
+        "sourcePeriodMinutes": None,
+        "currentSource": "getChargerInfo_initial",
+        "raw": {
+            "busiId": doc.get("busiId"),
+            "statId": doc["statId"],
+            "chgerId": doc["chgerId"],
+            "stat": clean_str(raw.get("stat")),
+            "statUpdDt": stat_upd_dt,
+            "lastTsdt": clean_str(raw.get("lastTsdt")),
+            "lastTedt": clean_str(raw.get("lastTedt")),
+            "nowTsdt": clean_str(raw.get("nowTsdt")),
+        },
+        "updatedAt": utc_now(),
+    }
+
+
+def upsert_current_status(db: Database, status_docs: list[dict[str, Any]]) -> dict[str, Any]:
+    """상태 수집 결과를 충전기별 최신 상태 컬렉션에 upsert합니다."""
+    operations: list[UpdateOne] = []
+
+    for doc in status_docs:
+        current_doc = build_current_doc_from_status_doc(doc)
+        operations.append(
+            UpdateOne(
+                {"statId": current_doc["statId"], "chgerId": current_doc["chgerId"]},
+                {
+                    "$set": current_doc,
+                    "$setOnInsert": {"createdAt": current_doc["lastObservedAt"]},
+                },
+                upsert=True,
+            )
+        )
+
+    result_summary = {"operationCount": len(operations), "matched": 0, "modified": 0, "upserted": 0}
+    if operations:
+        try:
+            result = db.charger_current.bulk_write(operations, ordered=False)
+            result_summary.update(
+                {
+                    "matched": result.matched_count,
+                    "modified": result.modified_count,
+                    "upserted": result.upserted_count,
+                }
+            )
+        except BulkWriteError as exc:
+            logger.exception("현재상태 bulk_write 실패: %s", exc.details)
+            raise
+
+    logger.info("현재상태 갱신 완료: %s", result_summary)
+    return result_summary
 
 
 # -----------------------------------------------------------------------------
@@ -542,6 +675,7 @@ def collect_master(db: Database) -> dict[str, Any]:
     )
 
     operations: list[UpdateOne] = []
+    current_operations: list[UpdateOne] = []
     skipped = 0
 
     for raw_item in raw_items:
@@ -561,6 +695,15 @@ def collect_master(db: Database) -> dict[str, Any]:
             )
         )
 
+        current_doc = build_current_doc_from_master_doc(doc, started_at)
+        current_operations.append(
+            UpdateOne(
+                {"statId": current_doc["statId"], "chgerId": current_doc["chgerId"]},
+                {"$setOnInsert": {**current_doc, "createdAt": started_at}},
+                upsert=True,
+            )
+        )
+
     result_summary = {
         "rawCount": len(raw_items),
         "operationCount": len(operations),
@@ -568,6 +711,8 @@ def collect_master(db: Database) -> dict[str, Any]:
         "matched": 0,
         "modified": 0,
         "upserted": 0,
+        "currentSeedMatched": 0,
+        "currentSeedUpserted": 0,
     }
 
     if operations:
@@ -582,6 +727,19 @@ def collect_master(db: Database) -> dict[str, Any]:
             )
         except BulkWriteError as exc:
             logger.exception("기본정보 bulk_write 실패: %s", exc.details)
+            raise
+
+    if current_operations:
+        try:
+            current_result = db.charger_current.bulk_write(current_operations, ordered=False)
+            result_summary.update(
+                {
+                    "currentSeedMatched": current_result.matched_count,
+                    "currentSeedUpserted": current_result.upserted_count,
+                }
+            )
+        except BulkWriteError as exc:
+            logger.exception("현재상태 초기 문서 bulk_write 실패: %s", exc.details)
             raise
 
     logger.info("기본정보 수집 종료: %s", result_summary)
@@ -614,6 +772,7 @@ def collect_status_once(db: Database) -> dict[str, Any]:
     )
 
     operations: list[UpdateOne] = []
+    status_docs: list[dict[str, Any]] = []
     skipped = 0
 
     for raw_item in raw_items:
@@ -621,6 +780,8 @@ def collect_status_once(db: Database) -> dict[str, Any]:
         if doc is None:
             skipped += 1
             continue
+
+        status_docs.append(doc)
 
         # 같은 충전기가 같은 10분 bucket에 이미 저장되어 있으면 새로 쓰지 않습니다.
         # 그래서 $set이 아니라 $setOnInsert만 사용합니다.
@@ -660,8 +821,13 @@ def collect_status_once(db: Database) -> dict[str, Any]:
 
     logger.info("상태정보 수집 종료: %s", result_summary)
 
+    current_result = upsert_current_status(db, status_docs)
+    result_summary["current"] = current_result
+
     stats_result = generate_basic_stats(db, collected_at=collected_at)
+    current_stats_result = generate_current_stats(db, collected_at=collected_at)
     result_summary["stats"] = stats_result
+    result_summary["currentStats"] = current_stats_result
     return result_summary
 
 
@@ -744,6 +910,66 @@ def generate_basic_stats(db: Database, collected_at: datetime | None = None) -> 
     return result
 
 
+
+
+def generate_current_stats(db: Database, collected_at: datetime | None = None) -> dict[str, Any]:
+    """
+    charger_current 기준으로 '현재 전체 충전기 상태' 통계를 생성합니다.
+
+    기존 generate_basic_stats는 해당 bucket에 API가 반환한 갱신 데이터 기준입니다.
+    대시보드의 전체 현황판은 이 함수의 결과를 사용하는 것이 안전합니다.
+    """
+    config = require_config()
+
+    if collected_at is None:
+        collected_at = utc_now()
+    if collected_at.tzinfo is None:
+        collected_at = collected_at.replace(tzinfo=timezone.utc)
+
+    collected_at_bucket = floor_datetime_to_minutes(collected_at, config.scheduler_interval_minutes)
+    generated_at = utc_now()
+
+    match_filter = {"zcode": config.seoul_zcode}
+    total_count = db.charger_current.count_documents(match_filter)
+
+    status_counts_pipeline = [
+        {"$match": match_filter},
+        {"$group": {"_id": "$stat", "count": {"$sum": 1}}},
+        {"$sort": {"_id": 1}},
+    ]
+    status_counts = {
+        str(row["_id"]): row["count"]
+        for row in db.charger_current.aggregate(status_counts_pipeline)
+    }
+
+    stats_doc = {
+        "type": "current_status",
+        "scope": "seoul",
+        "zcode": config.seoul_zcode,
+        "level": "city",
+        "collectedAtBucket": collected_at_bucket,
+        "totalChargers": total_count,
+        "statusCounts": status_counts,
+        "generatedAt": generated_at,
+        "generatedAtKst": to_kst_string(generated_at),
+    }
+
+    db.charger_stats.update_one(
+        {"type": "current_status", "collectedAtBucket": collected_at_bucket},
+        {"$set": stats_doc},
+        upsert=True,
+    )
+
+    result = {
+        "created": True,
+        "bucket": collected_at_bucket.isoformat(),
+        "totalChargers": total_count,
+        "statusCounts": status_counts,
+    }
+    logger.info("현재상태 통계 생성 완료: %s", result)
+    return result
+
+
 # -----------------------------------------------------------------------------
 # 스케줄러
 # -----------------------------------------------------------------------------
@@ -761,7 +987,7 @@ def run_scheduler() -> None:
     else:
         logger.info("REFRESH_MASTER_ON_START=false 이므로 시작 시 기본정보 수집은 건너뜁니다.")
 
-    scheduler = BlockingScheduler(timezone=timezone.utc)
+    scheduler = BlockingScheduler(timezone=KST)
 
     # max_instances=1: 이전 수집이 아직 끝나지 않았는데 다음 수집이 겹쳐 실행되는 것을 방지합니다.
     # coalesce=True: 서버가 잠깐 멈췄다가 살아났을 때 밀린 작업을 한꺼번에 실행하지 않습니다.
@@ -773,8 +999,21 @@ def run_scheduler() -> None:
         name="Collect EV charger status every interval",
         max_instances=1,
         coalesce=True,
-        next_run_time=utc_now(),  # 실행하자마자 1회 수집 후, 이후 10분마다 수집합니다.
+        next_run_time=datetime.now(KST),  # 실행하자마자 1회 수집 후, 이후 10분마다 수집합니다.
     )
+
+    if config.master_daily_refresh_enabled:
+        scheduler.add_job(
+            lambda: collect_master(db),
+            trigger="cron",
+            hour=config.master_refresh_hour_kst,
+            minute=0,
+            id="collect_master_daily",
+            name="Refresh EV charger master daily",
+            max_instances=1,
+            coalesce=True,
+        )
+        logger.info("기본정보 일 1회 갱신 예약: 매일 KST %02d:00", config.master_refresh_hour_kst)
 
     logger.info("스케줄러 시작: interval=%s분", config.scheduler_interval_minutes)
 
@@ -812,7 +1051,9 @@ def main() -> None:
         elif args.command == "collect-status-once":
             collect_status_once(db)
         elif args.command == "generate-stats":
+            # 기존 bucket 기준 갱신 데이터 통계와 charger_current 기준 전체 현재상태 통계를 함께 생성합니다.
             generate_basic_stats(db)
+            generate_current_stats(db)
         elif args.command == "run":
             client.close()
             run_scheduler()
