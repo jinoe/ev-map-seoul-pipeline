@@ -863,6 +863,23 @@ _SLOW_OCC_THRESHOLD = 14 * 60   # 완속 장기 점유 기준: 840분
 _FAST_OCC_MAX = 4 * 60          # 급속 최대 인정 점유: 240분
 _SLOW_OCC_MAX = 48 * 60         # 완속 최대 인정 점유: 2880분
 
+_WEEKDAY_LABELS = ["월", "화", "수", "목", "금", "토", "일"]
+
+# 한국환경공단 getChargerInfo API kind 코드 → 표시명
+# kindDetail이 텍스트인 경우 그대로 사용되며 이 맵은 2자리 숫자 코드에만 적용됨
+_FACILITY_KIND_MAP: dict[str, str] = {
+    "01": "주차장",
+    "02": "공동주택",
+    "03": "주거시설",
+    "04": "상업시설",
+    "05": "업무시설",
+    "06": "산업시설",
+    "07": "의료시설",
+    "08": "교육시설",
+    "09": "문화/관광",
+    "10": "기타",
+}
+
 
 def _sched_speed(chger_type: str | None, output_str: str | None) -> str:
     if chger_type in _SCHED_SLOW_CHGER:
@@ -1165,7 +1182,8 @@ def generate_precomputed_stats(
             {
                 "_id": 0, "statId": 1, "chgerId": 1, "statNm": 1,
                 "addr": 1, "lat": 1, "lng": 1, "chgerType": 1, "output": 1,
-                "kind": 1, "kindDetail": 1,
+                "kind": 1, "kindDetail": 1, "busiNm": 1,
+                "raw.maker": 1, "raw.year": 1,
             },
         ):
             sid = clean_str(master.get("statId"))
@@ -1177,6 +1195,7 @@ def generate_precomputed_stats(
             output_str = master.get("output")
             out_val = to_float(output_str) or 0.0
             addr = master.get("addr")
+            raw_master = master.get("raw") or {}
             city_rows.append({
                 "statId": sid,
                 "chgerId": cid,
@@ -1192,6 +1211,9 @@ def generate_precomputed_stats(
                 "speed": _sched_speed(chger_type, output_str),
                 "kind": master.get("kind"),
                 "kindDetail": master.get("kindDetail"),
+                "busiNm": master.get("busiNm"),
+                "makerName": clean_str(raw_master.get("maker")),
+                "year": clean_str(raw_master.get("year")),
                 "stat": stat,
                 "rawStatus": raw_status,
             })
@@ -1260,8 +1282,303 @@ def generate_precomputed_stats(
             db.charger_stats_cache.bulk_write(ops, ordered=False)
         logger.info("precomputed stats saved %d docs", len(docs))
 
+        generate_dashboard_stats_cache(db, city_rows, ref_kst, updated_at_kst, collected_at_bucket)
+
     except Exception:
         logger.exception("precomputed stats failed")
+
+
+def _sched_facility_label(kind: str | None, kind_detail: str | None) -> str:
+    """kind/kindDetail 코드 또는 텍스트를 표시용 레이블로 변환."""
+    for val in (kind_detail, kind):
+        v = (val or "").strip()
+        if v in _FACILITY_KIND_MAP:
+            return _FACILITY_KIND_MAP[v]
+        if v:
+            return v
+    return "기타"
+
+
+def _sched_top_group_fault_rate(
+    rows: list[dict[str, Any]],
+    field_fn,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, int]] = {}
+    for row in rows:
+        name = str(field_fn(row) or "미상")
+        if name not in grouped:
+            grouped[name] = {"total": 0, "fault": 0}
+        grouped[name]["total"] += 1
+        if row.get("stat") in _SCHED_FAULT:
+            grouped[name]["fault"] += 1
+    items = [
+        {
+            "name": k,
+            "total": v["total"],
+            "fault": v["fault"],
+            "rate": round(v["fault"] / v["total"] * 100, 2) if v["total"] else 0,
+        }
+        for k, v in grouped.items()
+    ]
+    return sorted(items, key=lambda x: (-x["fault"], -x["total"], x["name"]))[:limit]
+
+
+def _sched_install_year_fault_rate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, int]] = {}
+    for row in rows:
+        year = row.get("year") or "미상"
+        if year not in grouped:
+            grouped[year] = {"total": 0, "fault": 0}
+        grouped[year]["total"] += 1
+        if row.get("stat") in _SCHED_FAULT:
+            grouped[year]["fault"] += 1
+    return [
+        {
+            "year": yr,
+            "total": v["total"],
+            "fault": v["fault"],
+            "rate": round(v["fault"] / v["total"] * 100, 2) if v["total"] else 0,
+        }
+        for yr, v in sorted(grouped.items())
+    ]
+
+
+def _sched_facility_type_distribution(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    total = len(rows)
+    count_map: dict[str, int] = {}
+    for row in rows:
+        label = _sched_facility_label(row.get("kind"), row.get("kindDetail"))
+        count_map[label] = count_map.get(label, 0) + 1
+    return sorted(
+        [
+            {
+                "type": k,
+                "count": v,
+                "ratio": round(v / total * 100, 2) if total else 0,
+            }
+            for k, v in count_map.items()
+        ],
+        key=lambda x: -x["count"],
+    )
+
+
+def _sched_fault_trend(db: Database, end_bucket: datetime, limit: int = 48) -> list[dict[str, Any]]:
+    try:
+        cursor = db.charger_stats.find(
+            {"type": "basic_status_snapshot"},
+            {"_id": 0, "collectedAtBucket": 1, "statusCounts": 1, "totalChargers": 1},
+        ).sort("collectedAtBucket", -1).limit(limit)
+        items = []
+        for row in cursor:
+            counts = row.get("statusCounts") or {}
+            total = row.get("totalChargers") or sum(counts.values())
+            fault = sum(counts.get(s, 0) for s in _SCHED_FAULT)
+            bucket = row.get("collectedAtBucket")
+            if not bucket:
+                continue
+            if bucket.tzinfo is None:
+                bucket = bucket.replace(tzinfo=timezone.utc)
+            kst = bucket.astimezone(KST)
+            items.append({
+                "time": kst.isoformat(timespec="seconds"),
+                "fault": fault,
+                "total": total,
+                "rate": round(fault / total * 100, 2) if total else 0,
+            })
+        return list(reversed(items))
+    except Exception:
+        logger.exception("_sched_fault_trend failed")
+        return []
+
+
+def _sched_time_series_from_stats(
+    db: Database,
+    end_bucket: datetime,
+    days: int = 7,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    charger_stats (type=basic_status_snapshot)에서 최근 N일치 버킷을 읽어
+    (availabilityByWeekday, availabilityHeatmap, weekdayWeekendHourlyUsage)를 반환.
+    charger_status_snapshot 대신 집계된 통계를 사용해 쿼리 부하를 최소화한다.
+    """
+    start_time = end_bucket - timedelta(days=days)
+    try:
+        stat_docs = list(db.charger_stats.find(
+            {
+                "type": "basic_status_snapshot",
+                "collectedAtBucket": {"$gte": start_time, "$lte": end_bucket},
+            },
+            {"_id": 0, "statusCounts": 1, "totalChargers": 1, "collectedAtBucket": 1},
+        ))
+    except Exception:
+        logger.exception("_sched_time_series_from_stats: DB read failed")
+        return [], [], []
+
+    if not stat_docs:
+        logger.warning("dashboard stats cache: no charger_stats data in last %d days", days)
+        return [], [], []
+
+    wd_acc: dict[int, dict[str, int]] = {i: {"total": 0, "avail": 0} for i in range(7)}
+    heat_acc: dict[tuple[int, int], dict[str, int]] = {
+        (w, h): {"total": 0, "avail": 0, "charging": 0}
+        for w in range(7) for h in range(24)
+    }
+    usage_acc: dict[tuple[str, int], dict[str, int]] = {
+        (dt, h): {"total": 0, "charging": 0}
+        for dt in ("weekday", "weekend") for h in range(24)
+    }
+
+    for doc in stat_docs:
+        bucket = doc.get("collectedAtBucket")
+        if not bucket:
+            continue
+        if bucket.tzinfo is None:
+            bucket = bucket.replace(tzinfo=timezone.utc)
+        kst = bucket.astimezone(KST)
+        wd = kst.weekday()
+        h = kst.hour
+        counts = doc.get("statusCounts") or {}
+        total = int(doc.get("totalChargers") or sum(counts.values()))
+        avail = int(counts.get("2", 0))
+        charging = int(counts.get("3", 0))
+        if total <= 0:
+            continue
+        wd_acc[wd]["total"] += total
+        wd_acc[wd]["avail"] += avail
+        heat_acc[(wd, h)]["total"] += total
+        heat_acc[(wd, h)]["avail"] += avail
+        heat_acc[(wd, h)]["charging"] += charging
+        day_type = "weekend" if wd >= 5 else "weekday"
+        usage_acc[(day_type, h)]["total"] += total
+        usage_acc[(day_type, h)]["charging"] += charging
+
+    avail_by_weekday = [
+        {
+            "day": _WEEKDAY_LABELS[i],
+            "rate": round(wd_acc[i]["avail"] / wd_acc[i]["total"] * 100, 2) if wd_acc[i]["total"] else 0,
+            "total": wd_acc[i]["total"],
+        }
+        for i in range(7)
+    ]
+
+    avail_heatmap = [
+        {
+            "day": _WEEKDAY_LABELS[w],
+            "weekday": w,
+            "hour": h,
+            "availabilityRate": round(heat_acc[(w, h)]["avail"] / heat_acc[(w, h)]["total"] * 100, 2) if heat_acc[(w, h)]["total"] else 0,
+            "chargingRate": round(heat_acc[(w, h)]["charging"] / heat_acc[(w, h)]["total"] * 100, 2) if heat_acc[(w, h)]["total"] else 0,
+            "total": heat_acc[(w, h)]["total"],
+        }
+        for w in range(7) for h in range(24)
+    ]
+
+    hourly_usage = [
+        {
+            "type": dt,
+            "hour": h,
+            "chargingCount": usage_acc[(dt, h)]["charging"],
+            "chargingRate": round(usage_acc[(dt, h)]["charging"] / usage_acc[(dt, h)]["total"] * 100, 2) if usage_acc[(dt, h)]["total"] else 0,
+            "total": usage_acc[(dt, h)]["total"],
+        }
+        for dt in ("weekday", "weekend") for h in range(24)
+    ]
+
+    return avail_by_weekday, avail_heatmap, hourly_usage
+
+
+def generate_dashboard_stats_cache(
+    db: Database,
+    city_rows: list[dict[str, Any]],
+    ref_kst: datetime,
+    updated_at_kst: str,
+    collected_at_bucket: datetime,
+) -> None:
+    """
+    전체 대시보드 통계를 사전 계산하여 charger_stats_cache에 upsert합니다.
+    generate_precomputed_stats 종료 후 호출되며, 내부 예외를 모두 흡수합니다.
+    """
+    logger.info("dashboard stats cache started")
+    try:
+        if not city_rows:
+            logger.warning("dashboard stats cache skipped due to insufficient data")
+            return
+
+        now = utc_now()
+
+        # 1. 현재 상태 기반 KPI
+        overview = _sched_compute_overview(city_rows, ref_kst, updated_at_kst)
+        kpis = {
+            "totalChargers": overview["totalChargers"],
+            "totalStations": overview["totalStations"],
+            "availabilityRate": overview["availabilityRate"],
+            "availableCount": overview["availableCount"],
+            "chargingCount": overview["chargingCount"],
+            "faultCount": overview["faultCount"],
+            "longOccupancyCount": overview["longOccupancy"]["count"],
+            "updatedAt": updated_at_kst,
+        }
+
+        # 2. 제조사별 고장률 (charger_master의 raw.maker 사용)
+        manufacturer_fault_rate = _sched_top_group_fault_rate(
+            city_rows,
+            lambda r: r.get("makerName") or r.get("busiNm"),
+        )
+
+        # 3. 설치년도별 고장률
+        install_year_fault_rate = _sched_install_year_fault_rate(city_rows)
+
+        # 4. 시설 유형별 분포 (코드 → 레이블 매핑 적용)
+        facility_type_distribution = _sched_facility_type_distribution(city_rows)
+
+        # 5. 구별 순위
+        district_ranking = _sched_compute_districts(city_rows)[:10]
+
+        # 6. 고장 트렌드
+        fault_trend = _sched_fault_trend(db, collected_at_bucket)
+
+        # 7. 시계열 지표 (charger_stats 집계 버킷 사용 — 무거운 snapshot 쿼리 없음)
+        avail_by_weekday, avail_heatmap, hourly_usage = _sched_time_series_from_stats(
+            db, collected_at_bucket
+        )
+
+        has_ts = any(d.get("total", 0) > 0 for d in avail_by_weekday)
+        if not has_ts:
+            logger.warning("dashboard stats cache: time-series data empty (charger_stats may be sparse)")
+
+        payload: dict[str, Any] = {
+            "kpis": kpis,
+            "manufacturerFaultRate": manufacturer_fault_rate,
+            "installYearFaultRate": install_year_fault_rate,
+            "availabilityByWeekday": avail_by_weekday,
+            "availabilityHeatmap": avail_heatmap,
+            "weekdayWeekendHourlyUsage": hourly_usage,
+            "facilityTypeDistribution": facility_type_distribution,
+            "faultTrend": fault_trend,
+            "districtRanking": district_ranking,
+        }
+
+        db.charger_stats_cache.update_one(
+            {"type": "dashboard", "scopeKey": "city"},
+            {
+                "$set": {
+                    "type": "dashboard",
+                    "scopeKey": "city",
+                    "scope": {"level": "city"},
+                    "payload": payload,
+                    "sourceBucket": collected_at_bucket,
+                    "updatedAt": now,
+                    "generatedAt": now,
+                    "generatedAtKst": to_kst_string(now),
+                }
+            },
+            upsert=True,
+        )
+        logger.info("dashboard stats cache updated")
+
+    except Exception:
+        logger.exception("dashboard stats cache failed")
 
 
 def generate_basic_stats(db: Database, collected_at: datetime | None = None) -> dict[str, Any]:
@@ -1468,7 +1785,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="서울 전기차 충전소 API -> MongoDB 수집기")
     parser.add_argument(
         "command",
-        choices=["collect-master", "collect-status-once", "generate-stats", "generate-precomputed-stats", "run"],
+        choices=["collect-master", "collect-status-once", "generate-stats", "generate-precomputed-stats", "generate-dashboard-stats-cache", "run"],
         help="실행할 명령어",
     )
     args = parser.parse_args()
@@ -1492,6 +1809,54 @@ def main() -> None:
             config = require_config()
             bucket = floor_datetime_to_minutes(now, config.scheduler_interval_minutes)
             generate_precomputed_stats(db, now, bucket)
+        elif args.command == "generate-dashboard-stats-cache":
+            now = utc_now()
+            config = require_config()
+            bucket = floor_datetime_to_minutes(now, config.scheduler_interval_minutes)
+            # city_rows를 직접 구성해서 독립 실행
+            status_map: dict[tuple[str, str], dict[str, Any]] = {}
+            for doc in db.charger_current.find(
+                {}, {"_id": 0, "statId": 1, "chgerId": 1, "stat": 1, "raw": 1}
+            ):
+                sid = clean_str(doc.get("statId"))
+                cid = clean_str(doc.get("chgerId"))
+                if sid and cid:
+                    status_map[(sid, cid)] = doc
+            city_rows_cmd: list[dict[str, Any]] = []
+            for master in db.charger_master.find(
+                {"delYn": {"$ne": "Y"}},
+                {
+                    "_id": 0, "statId": 1, "chgerId": 1, "statNm": 1,
+                    "addr": 1, "lat": 1, "lng": 1, "chgerType": 1, "output": 1,
+                    "kind": 1, "kindDetail": 1, "busiNm": 1,
+                    "raw.maker": 1, "raw.year": 1,
+                },
+            ):
+                sid = clean_str(master.get("statId"))
+                cid = clean_str(master.get("chgerId"))
+                status = status_map.get((sid, cid), {}) if sid and cid else {}
+                raw_status = status.get("raw") or {}
+                stat = clean_str(status.get("stat")) or clean_str(raw_status.get("stat"))
+                chger_type = clean_str(master.get("chgerType"))
+                output_str = master.get("output")
+                out_val = to_float(output_str) or 0.0
+                addr = master.get("addr")
+                raw_master = master.get("raw") or {}
+                city_rows_cmd.append({
+                    "statId": sid, "chgerId": cid, "statNm": master.get("statNm"),
+                    "addr": addr, "gu": _sched_extract_gu(addr), "dong": _sched_extract_dong(addr),
+                    "lat": master.get("lat"), "lng": master.get("lng"),
+                    "chgerType": chger_type, "output": output_str, "outputVal": out_val,
+                    "speed": _sched_speed(chger_type, output_str),
+                    "kind": master.get("kind"), "kindDetail": master.get("kindDetail"),
+                    "busiNm": master.get("busiNm"),
+                    "makerName": clean_str(raw_master.get("maker")),
+                    "year": clean_str(raw_master.get("year")),
+                    "stat": stat, "rawStatus": raw_status,
+                })
+            ref_kst_cmd = now.astimezone(KST)
+            updated_at_kst_cmd = to_kst_string(now)
+            generate_dashboard_stats_cache(db, city_rows_cmd, ref_kst_cmd, updated_at_kst_cmd, bucket)
         elif args.command == "run":
             client.close()
             run_scheduler()
