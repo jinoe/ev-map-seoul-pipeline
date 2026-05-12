@@ -19,6 +19,7 @@ import argparse
 import logging
 import math
 import os
+import re
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -212,6 +213,21 @@ def create_indexes(db: Database) -> None:
         [("type", 1), ("collectedAtBucket", -1)],
         name="idx_stats_type_bucket",
     )
+
+    db.charger_current.create_index(
+        [("statId", 1), ("chgerId", 1)],
+        unique=True,
+        name="uq_current_statId_chgerId",
+    )
+    db.charger_current.create_index([("updatedAt", -1)], name="idx_current_updatedAt")
+
+    db.charger_stats_cache.create_index(
+        [("type", 1), ("scopeKey", 1)],
+        unique=True,
+        name="uq_stats_cache_type_scopeKey",
+    )
+    db.charger_stats_cache.create_index([("generatedAt", -1)], name="idx_stats_cache_generatedAt")
+    db.charger_stats_cache.create_index([("sourceBucket", -1)], name="idx_stats_cache_sourceBucket")
 
     logger.info("MongoDB 인덱스 생성 완료")
 
@@ -821,14 +837,477 @@ def collect_status_once(db: Database) -> dict[str, Any]:
 
     logger.info("상태정보 수집 종료: %s", result_summary)
 
-    current_result = upsert_current_status(db, status_docs)
-    result_summary["current"] = current_result
+    try:
+        update_charger_current(db, raw_items, collected_at, collected_at_bucket)
+    except Exception:
+        logger.exception("charger_current 갱신 실패 (계속 진행)")
+
+    generate_precomputed_stats(db, collected_at, collected_at_bucket)
 
     stats_result = generate_basic_stats(db, collected_at=collected_at)
     current_stats_result = generate_current_stats(db, collected_at=collected_at)
     result_summary["stats"] = stats_result
     result_summary["currentStats"] = current_stats_result
     return result_summary
+
+
+# -----------------------------------------------------------------------------
+# charger_current 갱신 및 통계 사전 계산
+# -----------------------------------------------------------------------------
+
+_SCHED_SLOW_CHGER: frozenset[str] = frozenset({"02", "08"})
+_SCHED_FAST_CHGER: frozenset[str] = frozenset({"01", "03", "04", "05", "06", "07", "09", "10"})
+_SCHED_FAULT: frozenset[str] = frozenset({"1", "4", "5"})
+_SCHED_STATUS_LABELS: dict[str, str] = {
+    "0": "알수없음", "1": "통신이상", "2": "사용가능",
+    "3": "충전중", "4": "운영중지", "5": "점검중", "9": "알수없음",
+}
+_FAST_OCC_THRESHOLD = 60         # 급속 장기 점유 기준: 60분
+_SLOW_OCC_THRESHOLD = 14 * 60   # 완속 장기 점유 기준: 840분
+_FAST_OCC_MAX = 4 * 60          # 급속 최대 인정 점유: 240분
+_SLOW_OCC_MAX = 48 * 60         # 완속 최대 인정 점유: 2880분
+
+
+def _sched_speed(chger_type: str | None, output_str: str | None) -> str:
+    if chger_type in _SCHED_SLOW_CHGER:
+        return "slow"
+    if chger_type in _SCHED_FAST_CHGER:
+        return "fast"
+    v = to_float(output_str)
+    return "fast" if (v is not None and v >= 50) else "slow"
+
+
+def _sched_extract_gu(addr: str | None) -> str | None:
+    if not addr:
+        return None
+    for part in str(addr).split():
+        if part.endswith("구") and len(part) > 1:
+            return part
+    return None
+
+
+def _sched_extract_dong(addr: str | None) -> str | None:
+    if not addr:
+        return None
+    text = str(addr)
+    for chunk in re.findall(r"\(([^)]*)\)", text):
+        for token in re.split(r"[\s,]+", chunk):
+            token = token.strip()
+            if re.search(r"(동|가)$", token) and len(token) > 1:
+                return token
+    for token in re.split(r"[\s,()]+", text):
+        token = token.strip()
+        if re.search(r"(동|가)$", token) and len(token) > 1:
+            return token
+    return None
+
+
+def _sched_parse_kst_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value).strip(), "%Y%m%d%H%M%S").replace(tzinfo=KST)
+    except ValueError:
+        return None
+
+
+def _sched_long_occ_item(row: dict[str, Any], ref_kst: datetime) -> dict[str, Any] | None:
+    if row.get("stat") != "3":
+        return None
+    raw = row.get("rawStatus") or {}
+    last_tsdt = _sched_parse_kst_dt(raw.get("lastTsdt"))
+    last_tedt = _sched_parse_kst_dt(raw.get("lastTedt"))
+    if last_tsdt and last_tedt and last_tedt > last_tsdt:
+        return None
+    started_at = _sched_parse_kst_dt(raw.get("nowTsdt"))
+    if not started_at:
+        return None
+    duration = int((ref_kst - started_at).total_seconds() // 60)
+    speed = row.get("speed", "slow")
+    threshold = _FAST_OCC_THRESHOLD if speed == "fast" else _SLOW_OCC_THRESHOLD
+    max_occ = _FAST_OCC_MAX if speed == "fast" else _SLOW_OCC_MAX
+    if duration < threshold or duration > max_occ:
+        return None
+    return {
+        "statId": row.get("statId"),
+        "chgerId": row.get("chgerId"),
+        "statNm": row.get("statNm"),
+        "addr": row.get("addr"),
+        "gu": row.get("gu"),
+        "dong": row.get("dong"),
+        "output": row.get("output"),
+        "speedType": speed,
+        "nowTsdt": raw.get("nowTsdt"),
+        "durationMinutes": max(duration, 0),
+        "lat": row.get("lat"),
+        "lng": row.get("lng"),
+    }
+
+
+def _sched_compute_overview(
+    rows: list[dict[str, Any]],
+    ref_kst: datetime,
+    updated_at_kst: str | None,
+    gu: str | None = None,
+    dong: str | None = None,
+) -> dict[str, Any]:
+    total = len(rows)
+    stations: set[str] = set()
+    available = charging = fault = maintenance = stopped = comm_err = unknown = 0
+    rapid = slow = ultra = 0
+    outputs: list[float] = []
+    long_occ: list[dict[str, Any]] = []
+    status_dist: dict[str, int] = {}
+    charger_type_dist: dict[str, int] = {}
+    facility_dist: dict[str, int] = {}
+
+    for row in rows:
+        sid = row.get("statId")
+        if sid:
+            stations.add(sid)
+
+        stat = row.get("stat")
+        if stat == "2":
+            available += 1
+        elif stat == "3":
+            charging += 1
+        elif stat == "1":
+            comm_err += 1
+        elif stat == "4":
+            stopped += 1
+        elif stat == "5":
+            maintenance += 1
+        else:
+            unknown += 1
+
+        if stat in _SCHED_FAULT:
+            fault += 1
+
+        label = _SCHED_STATUS_LABELS.get(stat or "", "알수없음")
+        status_dist[label] = status_dist.get(label, 0) + 1
+
+        out = row.get("outputVal") or 0.0
+        if out >= 200:
+            ultra += 1
+            charger_type_dist["초급속"] = charger_type_dist.get("초급속", 0) + 1
+        elif out >= 50:
+            rapid += 1
+            charger_type_dist["급속"] = charger_type_dist.get("급속", 0) + 1
+        else:
+            slow += 1
+            charger_type_dist["완속"] = charger_type_dist.get("완속", 0) + 1
+        if out > 0:
+            outputs.append(out)
+
+        fk = row.get("kind") or row.get("kindDetail") or "기타"
+        facility_dist[str(fk)] = facility_dist.get(str(fk), 0) + 1
+
+        item = _sched_long_occ_item(row, ref_kst)
+        if item:
+            long_occ.append(item)
+
+    long_occ.sort(key=lambda x: x["durationMinutes"], reverse=True)
+    fast_items = [i for i in long_occ if i["speedType"] == "fast"]
+    slow_items = [i for i in long_occ if i["speedType"] == "slow"]
+
+    return {
+        "scope": {"gu": gu, "dong": dong},
+        "updatedAt": updated_at_kst,
+        "totalChargers": total,
+        "totalStations": len(stations),
+        "rapidChargers": rapid,
+        "slowChargers": slow,
+        "ultraFastChargers": ultra,
+        "availableCount": available,
+        "chargingCount": charging,
+        "faultCount": fault,
+        "maintenanceCount": maintenance,
+        "stoppedCount": stopped,
+        "communicationErrorCount": comm_err,
+        "unknownCount": unknown,
+        "availabilityRate": round(available / total * 100, 2) if total else 0,
+        "avgOutput": round(sum(outputs) / len(outputs), 2) if outputs else 0,
+        "maxOutput": max(outputs) if outputs else 0,
+        "longOccupancy": {
+            "count": len(long_occ),
+            "fastCount": len(fast_items),
+            "slowCount": len(slow_items),
+            "thresholdMinutes": None,
+            "thresholdMinutesByType": {
+                "급속": _FAST_OCC_THRESHOLD,
+                "완속": _SLOW_OCC_THRESHOLD,
+            },
+            "items": long_occ[:20],
+            "fastItems": fast_items[:20],
+            "slowItems": slow_items[:20],
+        },
+        "statusDistribution": status_dist,
+        "chargerTypeDistribution": charger_type_dist,
+        "facilityDistribution": facility_dist,
+    }
+
+
+def _sched_compute_group_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    total = len(rows)
+    stations = {r.get("statId") for r in rows if r.get("statId")}
+    available = sum(1 for r in rows if r.get("stat") == "2")
+    charging = sum(1 for r in rows if r.get("stat") == "3")
+    fault = sum(1 for r in rows if r.get("stat") in _SCHED_FAULT)
+    outputs = [r.get("outputVal", 0.0) for r in rows if (r.get("outputVal") or 0) > 0]
+    rapid = sum(1 for o in outputs if 50 <= o < 200)
+    slow = sum(1 for o in outputs if o < 50)
+    ultra = sum(1 for o in outputs if o >= 200)
+    return {
+        "stations": len(stations),
+        "chargers": total,
+        "available": available,
+        "charging": charging,
+        "fault": fault,
+        "availabilityRate": round(available / total * 100, 2) if total else 0,
+        "avgOutput": round(sum(outputs) / len(outputs), 2) if outputs else 0,
+        "rapidChargers": rapid,
+        "slowChargers": slow,
+        "ultraFastChargers": ultra,
+    }
+
+
+def _sched_compute_districts(city_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    gu_groups: dict[str, list[dict[str, Any]]] = {}
+    for row in city_rows:
+        gu = row.get("gu")
+        if not gu or gu == "구 미상":
+            continue
+        gu_groups.setdefault(gu, []).append(row)
+
+    result = []
+    for gu, rows in gu_groups.items():
+        item = _sched_compute_group_stats(rows)
+        item["gu"] = gu
+        result.append(item)
+    return sorted(result, key=lambda x: (-x["chargers"], x["gu"]))
+
+
+def _sched_compute_dongs(gu_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    dong_groups: dict[str, list[dict[str, Any]]] = {}
+    for row in gu_rows:
+        dong = row.get("dong")
+        if not dong or dong == "동 미상":
+            continue
+        dong_groups.setdefault(dong, []).append(row)
+
+    result = []
+    for dong, rows in dong_groups.items():
+        item = _sched_compute_group_stats(rows)
+        item["dong"] = dong
+        result.append(item)
+    return sorted(result, key=lambda x: (-x["chargers"], x["dong"]))
+
+
+def _sched_compute_summary(
+    city_rows: list[dict[str, Any]],
+    generated_at: datetime,
+    generated_at_kst: str,
+    bucket: datetime,
+) -> dict[str, Any]:
+    total = len(city_rows)
+    status_counts: dict[str, int] = {}
+    for row in city_rows:
+        stat = row.get("stat") or "None"
+        status_counts[stat] = status_counts.get(stat, 0) + 1
+    available = status_counts.get("2", 0)
+    charging = status_counts.get("3", 0)
+    fault = sum(status_counts.get(s, 0) for s in _SCHED_FAULT)
+    unknown = sum(status_counts.get(s, 0) for s in ("0", "9", "None"))
+    stations = len({r.get("statId") for r in city_rows if r.get("statId")})
+    return {
+        "totalChargers": total,
+        "totalStations": stations,
+        "statusCounts": status_counts,
+        "availableCount": available,
+        "chargingCount": charging,
+        "faultCount": fault,
+        "unknownCount": unknown,
+        "availabilityRate": round(available / total * 100, 2) if total else 0,
+        "generatedAt": generated_at.isoformat(),
+        "generatedAtKst": generated_at_kst,
+        "collectedAtBucket": bucket.isoformat(),
+    }
+
+
+def update_charger_current(
+    db: Database,
+    raw_items: list[dict[str, Any]],
+    collected_at: datetime,
+    collected_at_bucket: datetime,
+) -> None:
+    """charger_current 컬렉션을 최신 상태로 upsert합니다."""
+    ops: list[UpdateOne] = []
+    for item in raw_items:
+        stat_id = clean_str(item.get("statId"))
+        chger_id = clean_str(item.get("chgerId"))
+        if not stat_id or not chger_id:
+            continue
+        ops.append(
+            UpdateOne(
+                {"statId": stat_id, "chgerId": chger_id},
+                {
+                    "$set": {
+                        "stat": clean_str(item.get("stat")),
+                        "statUpdDt": clean_str(item.get("statUpdDt")),
+                        "updatedAt": collected_at,
+                        "lastObservedAtKst": to_kst_string(collected_at),
+                        "lastSnapshotBucket": collected_at_bucket,
+                        "raw": item,
+                    }
+                },
+                upsert=True,
+            )
+        )
+    if ops:
+        try:
+            result = db.charger_current.bulk_write(ops, ordered=False)
+            logger.info(
+                "charger_current 갱신 완료: upserted=%d, matched=%d",
+                result.upserted_count,
+                result.matched_count,
+            )
+        except BulkWriteError as exc:
+            logger.exception("charger_current bulk_write 실패: %s", exc.details)
+            raise
+
+
+def generate_precomputed_stats(
+    db: Database,
+    collected_at: datetime,
+    collected_at_bucket: datetime,
+) -> None:
+    """
+    charger_master + charger_current에서 통계를 사전 계산하여
+    charger_stats_cache 컬렉션에 bulk upsert합니다.
+    수집 메인 플로우가 실패하지 않도록 내부 예외를 전부 흡수합니다.
+    """
+    logger.info("precomputed stats started")
+    try:
+        generated_at = utc_now()
+        generated_at_kst = to_kst_string(generated_at)
+        ref_kst = collected_at.astimezone(KST)
+        updated_at_kst = to_kst_string(collected_at)
+
+        # ── 1. charger_current 상태 맵 로드 ──────────────────────────────
+        status_map: dict[tuple[str, str], dict[str, Any]] = {}
+        for doc in db.charger_current.find(
+            {},
+            {"_id": 0, "statId": 1, "chgerId": 1, "stat": 1, "statUpdDt": 1, "raw": 1},
+        ):
+            sid = clean_str(doc.get("statId"))
+            cid = clean_str(doc.get("chgerId"))
+            if sid and cid:
+                status_map[(sid, cid)] = doc
+
+        # ── 2. charger_master 전체 로드 및 행 구성 ───────────────────────
+        city_rows: list[dict[str, Any]] = []
+        for master in db.charger_master.find(
+            {"delYn": {"$ne": "Y"}},
+            {
+                "_id": 0, "statId": 1, "chgerId": 1, "statNm": 1,
+                "addr": 1, "lat": 1, "lng": 1, "chgerType": 1, "output": 1,
+                "kind": 1, "kindDetail": 1,
+            },
+        ):
+            sid = clean_str(master.get("statId"))
+            cid = clean_str(master.get("chgerId"))
+            status = status_map.get((sid, cid), {}) if sid and cid else {}
+            raw_status = status.get("raw") or {}
+            stat = clean_str(status.get("stat")) or clean_str(raw_status.get("stat"))
+            chger_type = clean_str(master.get("chgerType"))
+            output_str = master.get("output")
+            out_val = to_float(output_str) or 0.0
+            addr = master.get("addr")
+            city_rows.append({
+                "statId": sid,
+                "chgerId": cid,
+                "statNm": master.get("statNm"),
+                "addr": addr,
+                "gu": _sched_extract_gu(addr),
+                "dong": _sched_extract_dong(addr),
+                "lat": master.get("lat"),
+                "lng": master.get("lng"),
+                "chgerType": chger_type,
+                "output": output_str,
+                "outputVal": out_val,
+                "speed": _sched_speed(chger_type, output_str),
+                "kind": master.get("kind"),
+                "kindDetail": master.get("kindDetail"),
+                "stat": stat,
+                "rawStatus": raw_status,
+            })
+
+        # ── 3. 캐시 문서 생성 ─────────────────────────────────────────────
+        def _make_doc(type_: str, scope_key: str, scope: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "type": type_,
+                "scopeKey": scope_key,
+                "scope": scope,
+                "payload": payload,
+                "generatedAt": generated_at,
+                "generatedAtKst": generated_at_kst,
+                "sourceBucket": collected_at_bucket,
+            }
+
+        docs: list[dict[str, Any]] = []
+
+        # city summary
+        docs.append(_make_doc(
+            "summary", "city", {"level": "city"},
+            _sched_compute_summary(city_rows, generated_at, generated_at_kst, collected_at_bucket),
+        ))
+
+        # city overview
+        docs.append(_make_doc(
+            "overview", "city", {"level": "city", "gu": None, "dong": None},
+            _sched_compute_overview(city_rows, ref_kst, updated_at_kst),
+        ))
+
+        # districts list
+        docs.append(_make_doc(
+            "districts", "city", {"level": "list"},
+            {"items": _sched_compute_districts(city_rows)},
+        ))
+
+        # gu groups: per-gu overview + dongs
+        gu_groups: dict[str, list[dict[str, Any]]] = {}
+        for row in city_rows:
+            gu = row.get("gu")
+            if gu and gu != "구 미상":
+                gu_groups.setdefault(gu, []).append(row)
+
+        for gu, gu_rows in gu_groups.items():
+            docs.append(_make_doc(
+                "overview", f"gu:{gu}",
+                {"level": "gu", "gu": gu, "dong": None},
+                _sched_compute_overview(gu_rows, ref_kst, updated_at_kst, gu=gu),
+            ))
+            docs.append(_make_doc(
+                "dongs", f"gu:{gu}",
+                {"level": "gu_dongs", "gu": gu},
+                {"items": _sched_compute_dongs(gu_rows)},
+            ))
+
+        # ── 4. Bulk upsert ────────────────────────────────────────────────
+        ops: list[UpdateOne] = [
+            UpdateOne(
+                {"type": doc["type"], "scopeKey": doc["scopeKey"]},
+                {"$set": doc},
+                upsert=True,
+            )
+            for doc in docs
+        ]
+        if ops:
+            db.charger_stats_cache.bulk_write(ops, ordered=False)
+        logger.info("precomputed stats saved %d docs", len(docs))
+
+    except Exception:
+        logger.exception("precomputed stats failed")
 
 
 def generate_basic_stats(db: Database, collected_at: datetime | None = None) -> dict[str, Any]:
@@ -1035,7 +1514,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="서울 전기차 충전소 API -> MongoDB 수집기")
     parser.add_argument(
         "command",
-        choices=["collect-master", "collect-status-once", "generate-stats", "run"],
+        choices=["collect-master", "collect-status-once", "generate-stats", "generate-precomputed-stats", "run"],
         help="실행할 명령어",
     )
     args = parser.parse_args()
@@ -1053,7 +1532,11 @@ def main() -> None:
         elif args.command == "generate-stats":
             # 기존 bucket 기준 갱신 데이터 통계와 charger_current 기준 전체 현재상태 통계를 함께 생성합니다.
             generate_basic_stats(db)
-            generate_current_stats(db)
+        elif args.command == "generate-precomputed-stats":
+            now = utc_now()
+            config = require_config()
+            bucket = floor_datetime_to_minutes(now, config.scheduler_interval_minutes)
+            generate_precomputed_stats(db, now, bucket)
         elif args.command == "run":
             client.close()
             run_scheduler()
