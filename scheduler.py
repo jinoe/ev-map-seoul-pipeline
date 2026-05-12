@@ -214,11 +214,6 @@ def create_indexes(db: Database) -> None:
         name="idx_stats_type_bucket",
     )
 
-    db.charger_current.create_index(
-        [("statId", 1), ("chgerId", 1)],
-        unique=True,
-        name="uq_current_statId_chgerId",
-    )
     db.charger_current.create_index([("updatedAt", -1)], name="idx_current_updatedAt")
 
     db.charger_stats_cache.create_index(
@@ -838,7 +833,8 @@ def collect_status_once(db: Database) -> dict[str, Any]:
     logger.info("상태정보 수집 종료: %s", result_summary)
 
     try:
-        update_charger_current(db, raw_items, collected_at, collected_at_bucket)
+        current_result = upsert_current_status(db, status_docs)
+        result_summary["current"] = current_result
     except Exception:
         logger.exception("charger_current 갱신 실패 (계속 진행)")
 
@@ -1132,48 +1128,6 @@ def _sched_compute_summary(
         "generatedAtKst": generated_at_kst,
         "collectedAtBucket": bucket.isoformat(),
     }
-
-
-def update_charger_current(
-    db: Database,
-    raw_items: list[dict[str, Any]],
-    collected_at: datetime,
-    collected_at_bucket: datetime,
-) -> None:
-    """charger_current 컬렉션을 최신 상태로 upsert합니다."""
-    ops: list[UpdateOne] = []
-    for item in raw_items:
-        stat_id = clean_str(item.get("statId"))
-        chger_id = clean_str(item.get("chgerId"))
-        if not stat_id or not chger_id:
-            continue
-        ops.append(
-            UpdateOne(
-                {"statId": stat_id, "chgerId": chger_id},
-                {
-                    "$set": {
-                        "stat": clean_str(item.get("stat")),
-                        "statUpdDt": clean_str(item.get("statUpdDt")),
-                        "updatedAt": collected_at,
-                        "lastObservedAtKst": to_kst_string(collected_at),
-                        "lastSnapshotBucket": collected_at_bucket,
-                        "raw": item,
-                    }
-                },
-                upsert=True,
-            )
-        )
-    if ops:
-        try:
-            result = db.charger_current.bulk_write(ops, ordered=False)
-            logger.info(
-                "charger_current 갱신 완료: upserted=%d, matched=%d",
-                result.upserted_count,
-                result.matched_count,
-            )
-        except BulkWriteError as exc:
-            logger.exception("charger_current bulk_write 실패: %s", exc.details)
-            raise
 
 
 def generate_precomputed_stats(
@@ -1532,6 +1486,7 @@ def main() -> None:
         elif args.command == "generate-stats":
             # 기존 bucket 기준 갱신 데이터 통계와 charger_current 기준 전체 현재상태 통계를 함께 생성합니다.
             generate_basic_stats(db)
+            generate_current_stats(db)
         elif args.command == "generate-precomputed-stats":
             now = utc_now()
             config = require_config()
